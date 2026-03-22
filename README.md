@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ## C Compiler GUI
 
 A PyQt5 GUI for editing, compiling (via `gcc`), running C programs, and showing:
@@ -53,3 +54,7 @@ On first compile, the GUI will automatically build the Java backend into `build/
 - Print: `print(x);`
 - Expressions: `+ - * /` with parentheses
 
+=======
+# Compilify
+A Mini C compiler which on correct code compilation give output and show different phases of compiler and if any error occur it tells the error in easy or friendly manner along with that tell the category of error occured.
+>>>>>>> 9a4abf558a34b21bea08f7144ffd6a34df48a126
