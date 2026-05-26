@@ -4,6 +4,7 @@ from gui.main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("Advanced Compiler GUI")
     window = MainWindow()
     window.show()

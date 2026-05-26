@@ -127,25 +127,49 @@ def tokenize(code: str) -> List[Token]:
     return tokens
 
 
-def lexical_analysis(code: str) -> Tuple[List[Tuple[int, str]], List[Token]]:
-    errors: List[Tuple[int, str]] = []
+def lexical_analysis(code: str) -> Tuple[List[Tuple[int, str, str]], List[Token]]:
+    """Returns (errors, tokens). Each error is (line, message, suggestion)."""
+    errors: List[Tuple[int, str, str]] = []
     tokens = tokenize(code)
+
+    sug_invalid_symbol = (
+        "Remove or replace the character; C programs use ASCII letters, digits, and standard punctuation. "
+        "If you pasted from a document, retype quotes as \" and apostrophes as '."
+    )
+    sug_bad_ident = (
+        "Identifiers must start with a letter or underscore, then letters/digits/underscore. "
+        "Valid: int count1;  Invalid: int 1count;  Use: int x = 10; instead of merging digits into the name."
+    )
+
+    lines = code.splitlines()
+    bad_ident_lines: set[int] = set()
+    for idx, line in enumerate(lines, start=1):
+        for m in re.finditer(r"\b\d+[A-Za-z_][A-Za-z0-9_]*\b", line):
+            bad = m.group(0)
+            bad_ident_lines.add(idx)
+            errors.append((idx, f"Lexical Error: Invalid identifier `{bad}`", sug_bad_ident))
 
     for t in tokens:
         if t.kind == "Unknown":
-            errors.append((t.line, f"Lexical Error: Invalid symbol `{t.lexeme}`"))
-
-    lines = code.splitlines()
-    for idx, line in enumerate(lines, start=1):
-        for m in re.finditer(r"\b\d+[A-Za-z_][A-Za-z0-9_]*\b", line):
-            errors.append((idx, f"Lexical Error: Invalid identifier `{m.group(0)}`"))
+            if t.line in bad_ident_lines:
+                continue
+            errors.append((t.line, f"Lexical Error: Invalid symbol `{t.lexeme}`", sug_invalid_symbol))
 
     for t in tokens:
         if t.kind == "Identifier" and not _IDENT_RE.match(t.lexeme):
-            errors.append((t.line, f"Lexical Error: Invalid identifier `{t.lexeme}`"))
+            errors.append((t.line, f"Lexical Error: Invalid identifier `{t.lexeme}`", sug_bad_ident))
 
-    errors.sort(key=lambda x: x[0])
-    return errors, tokens
+    seen: set[Tuple[int, str]] = set()
+    deduped: List[Tuple[int, str, str]] = []
+    for err in errors:
+        key = (err[0], err[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(err)
+
+    deduped.sort(key=lambda x: x[0])
+    return deduped, tokens
 
 
 def tokens_as_rows(tokens: Sequence[Token]) -> List[Tuple[str, str, int, int]]:

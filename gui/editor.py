@@ -99,9 +99,12 @@ class CSyntaxHighlighter(QSyntaxHighlighter):
 class CodeEditor(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("codeEditor")
 
         self._error_line_set: set[int] = set()
         self._error_color = QColor(255, 80, 80, 60)
+        self._dark_mode = False
+        self._gutter_error_color = QColor("#f85149")
 
         self._line_number_area = LineNumberArea(self)
         self._highlighter = CSyntaxHighlighter(self.document())
@@ -143,9 +146,14 @@ class CodeEditor(QPlainTextEdit):
         cr = self.contentsRect()
         self._line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
 
+    def set_theme(self, dark: bool) -> None:
+        self._dark_mode = dark
+        self._line_number_area.update()
+
     def line_number_area_paint_event(self, event):
         painter = QPainter(self._line_number_area)
-        painter.fillRect(event.rect(), QColor(30, 30, 30, 30))
+        gutter_bg = QColor(30, 30, 30, 40) if not self._dark_mode else QColor(22, 27, 34)
+        painter.fillRect(event.rect(), gutter_bg)
 
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
@@ -154,12 +162,19 @@ class CodeEditor(QPlainTextEdit):
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
-                number = str(block_number + 1)
-                painter.setPen(QColor(140, 140, 140))
+                line_no = block_number + 1
+                if line_no in self._error_line_set:
+                    painter.fillRect(0, top, 4, self.fontMetrics().height(), self._gutter_error_color)
+
+                number = str(line_no)
+                num_color = QColor(100, 116, 139) if not self._dark_mode else QColor(139, 148, 158)
+                if line_no in self._error_line_set:
+                    num_color = self._gutter_error_color
+                painter.setPen(num_color)
                 painter.drawText(
-                    0,
+                    6,
                     top,
-                    self._line_number_area.width() - 4,
+                    self._line_number_area.width() - 6,
                     self.fontMetrics().height(),
                     Qt.AlignRight,
                     number,

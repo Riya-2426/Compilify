@@ -37,10 +37,11 @@ _FUNC_HEADER_REQUIREMENTS: dict[str, str] = {
 }
 
 
-def semantic_check(code: str) -> List[Tuple[int, str]]:
+def semantic_check(code: str) -> List[Tuple[int, str, str]]:
+    """Each error is (line, message, suggestion)."""
     declared: Dict[str, str] = {}
     declared_lines: Dict[str, int] = {}
-    errors: List[Tuple[int, str]] = []
+    errors: List[Tuple[int, str, str]] = []
 
     included_headers: Set[str] = set()
     preproc_lines: Set[int] = set()
@@ -52,8 +53,16 @@ def semantic_check(code: str) -> List[Tuple[int, str]]:
             included_headers.add(m.group("hdr").strip())
 
     tokens = tokenize(code)
+
+    # Lines with an odd number of `"` (in code, not // comments) confuse the tokenizer.
+    unclosed_string_lines: Set[int] = set()
+    for ln, line in enumerate(code.splitlines(), start=1):
+        if _line_has_unclosed_string(line):
+            unclosed_string_lines.add(ln)
+
     skip_idents: Set[str] = set(C_KEYWORDS)
-    decl_lines: Set[int] = set()
+    # Names declared on a given line (not identifiers used in initializers).
+    declared_on_line: Set[Tuple[int, str]] = set()
 
     type_keywords = {"int", "float", "char"}
 
@@ -65,35 +74,58 @@ def semantic_check(code: str) -> List[Tuple[int, str]]:
             line = t.line
 
             j = i + 1
-            just_saw_comma = False
+            in_initializer = False
             while j < len(tokens) and tokens[j].line == line:
                 tok = tokens[j]
                 if tok.lexeme == ";":
                     break
-                if tok.lexeme == ",":
-                    just_saw_comma = True
+                if tok.lexeme == "=":
+                    in_initializer = True
                     j += 1
                     continue
-                if tok.lexeme in {"*", "[" , "]"}:
+                if tok.lexeme == ",":
+                    in_initializer = False
+                    j += 1
+                    continue
+                if tok.lexeme in {"*", "[", "]"}:
                     j += 1
                     continue
                 if tok.kind == "Identifier":
                     # Function prototypes/definitions: ignore identifier followed by '('
                     if j + 1 < len(tokens) and tokens[j + 1].lexeme == "(":
                         j += 1
-                        just_saw_comma = False
+                        continue
+
+                    if in_initializer:
+                        # e.g. int z = a + b  ->  a, b are uses, not declarations
+                        use_name = tok.lexeme
+                        if use_name not in declared and use_name not in skip_idents:
+                            errors.append(
+                                (
+                                    line,
+                                    f"Semantic Error: Undeclared variable `{use_name}`",
+                                    f"Declare before use. Example: int {use_name};  or  int {use_name} = 0;  "
+                                    f"then use it on later lines inside the same function.",
+                                )
+                            )
+                        j += 1
                         continue
 
                     name = tok.lexeme
-                    decl_lines.add(line)
+                    declared_on_line.add((line, name))
                     if name in declared:
+                        prev = declared_lines[name]
                         errors.append(
-                            (line, f"Semantic Error: Duplicate declaration of `{name}` (previous at line {declared_lines[name]})")
+                            (
+                                line,
+                                f"Semantic Error: Duplicate declaration of `{name}` (previous at line {prev})",
+                                f"Use each variable name once per scope. Example: int {name} = 0; only once, "
+                                f"or pick a new name for the second variable (e.g. {name}2).",
+                            )
                         )
                     else:
                         declared[name] = decl_type
                         declared_lines[name] = line
-                    just_saw_comma = False
                 j += 1
 
             i = j
@@ -108,16 +140,57 @@ def semantic_check(code: str) -> List[Tuple[int, str]]:
             continue
         if t.line in preproc_lines:
             continue
-        if t.line in decl_lines:
+        if (t.line, ident) in declared_on_line:
+            continue
+        if t.line in unclosed_string_lines:
             continue
         if i + 1 < len(tokens) and tokens[i + 1].lexeme == "(":
             required = _FUNC_HEADER_REQUIREMENTS.get(ident)
             if required and required not in included_headers:
-                errors.append((t.line, f"Semantic Error: Missing header `<{required}>` for `{ident}()`"))
+                errors.append(
+                    (
+                        t.line,
+                        f"Semantic Error: Missing header `<{required}>` for `{ident}()`",
+                        f"Add at the top of the file: #include <{required}>   "
+                        f"(before any call to `{ident}`). Example: #include <stdio.h>",
+                    )
+                )
             continue
         if ident not in declared:
-            errors.append((t.line, f"Semantic Error: Undeclared variable `{ident}`"))
+            errors.append(
+                (
+                    t.line,
+                    f"Semantic Error: Undeclared variable `{ident}`",
+                    f"Declare before use. Example: int {ident};  or  int {ident} = 0;  "
+                    f"then use it on later lines inside the same function.",
+                )
+            )
 
-    errors.sort(key=lambda x: x[0])
-    return errors
+    seen: Set[Tuple[int, str]] = set()
+    deduped: List[Tuple[int, str, str]] = []
+    for err in errors:
+        key = (err[0], err[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(err)
+
+    deduped.sort(key=lambda x: x[0])
+    return deduped
+
+
+def _line_has_unclosed_string(line: str) -> bool:
+    """True if a double-quoted string on this line is not closed (ignores // comments)."""
+    code = line.split("//", 1)[0]
+    in_string = False
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if ch == "\\" and in_string:
+            i += 2
+            continue
+        if ch == '"':
+            in_string = not in_string
+        i += 1
+    return in_string
 

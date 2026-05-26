@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QFont, QTextBlockUserData, QTextCharFormat, QTextCursor
+from PyQt5.QtGui import QColor, QFont, QKeySequence, QTextCursor
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -20,21 +21,26 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
-    QProgressDialog,
 )
 
+from compiler.error_filter import filter_cascade_syntax_errors, find_root_error_lines
 from compiler.gcc_runner import compile_with_gcc, run_executable
 from compiler.lexer import lexical_analysis, tokens_as_rows
+from compiler.optimizer import optimize_code
 from compiler.semantic import semantic_check
 from compiler.symbol_table import symbol_rows_for_gui
 from gui.editor import CodeEditor
+from gui.themes import load_stylesheet
+from gui.widgets.problems_panel import ProblemsPanel
 from utils.file_manager import open_c_file, save_as, save_file
 
 
@@ -43,112 +49,43 @@ class CompileMessage:
     line: int
     kind: str
     message: str
+    suggestion: str = ""
 
 
 ERROR_COLORS_LIGHT = {
-    "Lexical": QColor("#B8860B"),
-    "Semantic": QColor("#CC6600"),
-    "Syntax": QColor("#C62828"),
-    "Info": QColor("#1565C0"),
+    "Lexical": QColor("#B45309"),
+    "Semantic": QColor("#C2410C"),
+    "Syntax": QColor("#DC2626"),
+    "Info": QColor("#2563EB"),
 }
 
 ERROR_COLORS_DARK = {
-    "Lexical": QColor("#FFD54A"),
-    "Semantic": QColor("#FFB74D"),
-    "Syntax": QColor("#EF5350"),
-    "Info": QColor("#9CDCFE"),
+    "Lexical": QColor("#FBBF24"),
+    "Semantic": QColor("#FB923C"),
+    "Syntax": QColor("#F87171"),
+    "Info": QColor("#58A6FF"),
 }
 
+SAMPLE_CODE = """#include <stdio.h>
 
-def _light_stylesheet() -> str:
-    return """
-QMainWindow { background: #e8e8e8; }
-QMenuBar { background: #f0f0f0; color: #222; border-bottom: 1px solid #ccc; }
-QMenuBar::item:selected { background: #d0d0d0; }
-QMenu { background: #fff; color: #222; border: 1px solid #ccc; }
-QMenu::item:selected { background: #e0e8f0; }
-QToolBar {
-  background: #f5f5f5;
-  border: none;
-  border-bottom: 1px solid #ccc;
-  spacing: 8px;
-  padding: 6px 8px;
-}
-QToolBar QToolButton {
-  background: #fff;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  padding: 6px 12px;
-  color: #222;
-}
-QToolBar QToolButton:hover { background: #eef6ff; border-color: #99c; }
-QStatusBar { background: #f0f0f0; color: #333; border-top: 1px solid #ccc; }
-QFrame#panel { background: #fff; border: 1px solid #ccc; border-radius: 4px; }
-QLabel#panelTitle { font-weight: bold; color: #333; padding: 4px; }
-QPlainTextEdit {
-  background: #fff;
-  color: #111;
-  border: 1px solid #ccc;
-  border-radius: 2px;
-}
-QTableWidget {
-  background: #fff;
-  color: #111;
-  gridline-color: #ccc;
-  alternate-background-color: #e8f4fc;
-}
-QHeaderView::section {
-  background: #e8e8e8;
-  color: #222;
-  padding: 6px;
-  border: 1px solid #ccc;
-  font-weight: bold;
-}
-QPushButton {
-  background: #fff;
-  border: 1px solid #bbb;
-  border-radius: 6px;
-  padding: 6px 14px;
-  color: #222;
-}
-QPushButton:hover { background: #eef6ff; }
-QCheckBox { color: #222; }
-"""
+int main() {
+    int a = 10;
+    int b = 20;
+    int c;
 
+    c = a + b;
 
-def _dark_stylesheet() -> str:
-    return """
-QMainWindow { background: #1e1e1e; }
-QMenuBar { background: #252526; color: #d4d4d4; border-bottom: 1px solid #333; }
-QMenuBar::item:selected { background: #333; }
-QMenu { background: #252526; color: #d4d4d4; }
-QMenu::item:selected { background: #333; }
-QToolBar { background: #252526; border-bottom: 1px solid #333; spacing: 8px; padding: 6px; }
-QToolBar QToolButton {
-  background: #333;
-  border: 1px solid #444;
-  border-radius: 6px;
-  padding: 6px 12px;
-  color: #d4d4d4;
+    printf("Value = %d\\n", c);
+    return 0;
 }
-QToolBar QToolButton:hover { background: #3a3a3a; }
-QStatusBar { background: #252526; color: #d4d4d4; border-top: 1px solid #333; }
-QFrame#panel { background: #252526; border: 1px solid #333; border-radius: 4px; }
-QLabel#panelTitle { font-weight: bold; color: #ccc; padding: 4px; }
-QPlainTextEdit { background: #1e1e1e; color: #d4d4d4; border: 1px solid #333; }
-QTableWidget { background: #1e1e1e; color: #d4d4d4; gridline-color: #333; alternate-background-color: #2a2d2e; }
-QHeaderView::section { background: #333; color: #d4d4d4; border: 1px solid #444; padding: 6px; }
-QPushButton { background: #333; color: #d4d4d4; border: 1px solid #444; border-radius: 6px; padding: 6px 14px; }
-QPushButton:hover { background: #3a3a3a; }
-QCheckBox { color: #d4d4d4; }
 """
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Advanced Compiler GUI")
-        self.resize(1280, 820)
+        self.setWindowTitle("Advanced Compiler IDE")
+        self.resize(1360, 860)
 
         self._current_path: Optional[str] = None
         self._last_build_dir: Optional[str] = None
@@ -156,15 +93,24 @@ class MainWindow(QMainWindow):
         self._compile_messages: List[CompileMessage] = []
         self._dark_mode = False
         self._block_dark_sync = False
+        self._dirty = False
+        self._block_dirty = False
 
         self._editor = CodeEditor(self)
         self._output = QPlainTextEdit(self)
         self._output.setReadOnly(True)
-        self._output.setPlaceholderText("Compiler messages and program output appear here…")
-        out_font = QFont("Consolas")
-        out_font.setStyleHint(QFont.Monospace)
-        out_font.setPointSize(10)
-        self._output.setFont(out_font)
+        self._output.setPlaceholderText("Build log and program output…")
+        self._opt_log = QPlainTextEdit(self)
+        self._opt_log.setReadOnly(True)
+        self._opt_log.setPlaceholderText("Optimization notes appear here…")
+
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.Monospace)
+        mono.setPointSize(10)
+        self._output.setFont(mono)
+        self._opt_log.setFont(mono)
+
+        self._problems = ProblemsPanel(self, on_jump=self._editor.scroll_to_line)
 
         self._tokens = QTableWidget(self)
         self._tokens.setColumnCount(4)
@@ -173,6 +119,7 @@ class MainWindow(QMainWindow):
         self._tokens.setEditTriggers(QTableWidget.NoEditTriggers)
         self._tokens.setSelectionBehavior(QTableWidget.SelectRows)
         self._tokens.setAlternatingRowColors(True)
+        self._tokens.setShowGrid(False)
         self._tokens.cellDoubleClicked.connect(self._jump_to_token)
 
         self._symbol_table = QTableWidget(self)
@@ -182,17 +129,20 @@ class MainWindow(QMainWindow):
         self._symbol_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._symbol_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._symbol_table.setAlternatingRowColors(True)
+        self._symbol_table.setShowGrid(False)
 
         self._build_layout()
         self._build_menu()
         self._build_toolbar()
         self._build_status_bar()
+        self._setup_shortcuts()
 
         self._editor.cursorPositionChanged.connect(self._update_status_cursor)
         self._editor.textChanged.connect(self._on_text_changed)
         self._update_status_cursor()
         self._on_text_changed()
-
+        self._update_window_title()
+        self._set_compile_status("Ready")
         self._apply_theme()
 
     def _panel(self) -> QFrame:
@@ -201,163 +151,212 @@ class MainWindow(QMainWindow):
         f.setFrameShape(QFrame.StyledPanel)
         return f
 
-    def _build_layout(self) -> None:
-        style = self.style()
+    def _build_welcome_page(self) -> QWidget:
+        page = QWidget(self)
+        lay = QVBoxLayout(page)
+        lay.setAlignment(Qt.AlignCenter)
 
-        # Left: header + editor
+        card = QFrame(page)
+        card.setObjectName("welcomeCard")
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(40, 36, 40, 36)
+        card_lay.setSpacing(16)
+
+        title = QLabel("Advanced C Compiler IDE", card)
+        title.setObjectName("welcomeTitle")
+        title.setAlignment(Qt.AlignCenter)
+        card_lay.addWidget(title)
+
+        hint = QLabel(
+            "Write or open a C program, then Compile, Optimize, or Run.\n"
+            "Shortcuts: F7 Compile · F5 Run · Ctrl+Shift+O Optimize · Ctrl+S Save",
+            card,
+        )
+        hint.setObjectName("welcomeHint")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        card_lay.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+        btn_open = QPushButton("Open File…", card)
+        btn_open.setObjectName("primaryBtn")
+        btn_open.clicked.connect(self.open_file)
+        btn_sample = QPushButton("Load Sample", card)
+        btn_sample.clicked.connect(self._load_sample)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_open)
+        btn_row.addWidget(btn_sample)
+        btn_row.addStretch(1)
+        card_lay.addLayout(btn_row)
+
+        lay.addWidget(card)
+        return page
+
+    def _build_layout(self) -> None:
+        # Top header bar
+        header = QFrame(self)
+        header.setObjectName("headerBar")
+        header_lay = QHBoxLayout(header)
+        header_lay.setContentsMargins(16, 8, 16, 8)
+        self._lbl_header_title = QLabel("Advanced C Compiler IDE", header)
+        self._lbl_header_title.setObjectName("headerTitle")
+        self._lbl_file = QLabel("Untitled", header)
+        self._lbl_file.setObjectName("headerFile")
+        self._lbl_dirty = QLabel("", header)
+        self._lbl_dirty.setObjectName("headerDirty")
+        header_lay.addWidget(self._lbl_header_title)
+        header_lay.addSpacing(16)
+        header_lay.addWidget(self._lbl_file, 1)
+        header_lay.addWidget(self._lbl_dirty)
+
+        # Editor area with welcome overlay
+        self._editor_stack = QStackedWidget(self)
+        self._editor_stack.addWidget(self._build_welcome_page())
+        editor_wrap = self._panel()
+        editor_lay = QVBoxLayout(editor_wrap)
+        editor_lay.setContentsMargins(4, 4, 4, 4)
+        editor_lay.addWidget(self._editor)
+        self._editor_stack.addWidget(editor_wrap)
+        self._editor_stack.setCurrentIndex(0)
+
         left_wrap = self._panel()
         left_lay = QVBoxLayout(left_wrap)
         left_lay.setContentsMargins(8, 8, 8, 8)
         left_lay.setSpacing(8)
+        left_lay.addWidget(self._editor_stack, 1)
 
-        ed_header = QHBoxLayout()
-        btn_compile = QPushButton(style.standardIcon(QStyle.SP_DialogApplyButton), " Compile", self)
-        btn_compile.clicked.connect(self.compile_code)
-        btn_clear_ed = QPushButton(style.standardIcon(QStyle.SP_TrashIcon), " Clear Output", self)
-        btn_clear_ed.clicked.connect(self.clear_output)
-        ed_header.addWidget(btn_compile)
-        ed_header.addWidget(btn_clear_ed)
-        ed_header.addStretch(1)
-        left_lay.addLayout(ed_header)
-        left_lay.addWidget(self._editor, 1)
+        # Right: tabbed panels
+        self._right_tabs = QTabWidget(self)
+        self._right_tabs.setDocumentMode(True)
+        self._right_tabs.addTab(self._problems, "Problems")
+        self._right_tabs.addTab(self._output, "Output")
+        self._right_tabs.addTab(self._tokens, "Tokens")
+        self._right_tabs.addTab(self._symbol_table, "Symbols")
+        self._right_tabs.addTab(self._opt_log, "Optimization")
 
-        # Right top: Output Terminal
-        out_wrap = self._panel()
-        out_lay = QVBoxLayout(out_wrap)
-        out_lay.setContentsMargins(8, 8, 8, 8)
-        out_lay.setSpacing(6)
-        out_head = QHBoxLayout()
-        out_title = QLabel("Output Terminal", self)
-        out_title.setObjectName("panelTitle")
-        btn_clear_out = QPushButton(style.standardIcon(QStyle.SP_TrashIcon), " Clear", self)
-        btn_clear_out.clicked.connect(self.clear_output)
-        out_head.addWidget(out_title)
-        out_head.addStretch(1)
-        out_head.addWidget(btn_clear_out)
-        out_lay.addLayout(out_head)
-        out_lay.addWidget(self._output, 1)
-
-        # Right bottom: Symbol Table
-        sym_wrap = self._panel()
-        sym_lay = QVBoxLayout(sym_wrap)
-        sym_lay.setContentsMargins(8, 8, 8, 8)
-        sym_lay.setSpacing(6)
-        sym_title = QLabel("Symbol Table", self)
-        sym_title.setObjectName("panelTitle")
-        sym_lay.addWidget(sym_title)
-        sym_lay.addWidget(self._symbol_table, 1)
-
-        # Tokens (lexical) — bottom of symbol area or separate? Image shows Symbol Table only.
-        # Keep tokens in a tab under output OR stack tokens below symbol. Reference had tokens table.
-        # Advanced GUI image: only Symbol Table on bottom right. We use symbol table + hide tokens in splitter
-        # OR put tokens in a third tab. User asked for "like this" — Symbol Table bottom, Output top.
-        # Add lexical tokens as a small third row or tabs. Simpler: vertical split: output | tokens+symbol
-        # Re-read: first user image had Output + lexical table. Advanced image has Output Terminal + Symbol Table.
-        # I'll stack: Output, then row with horizontal split: Tokens (left) | Symbol (right) — too busy.
-        # Best: right column = Output (top), bottom = horizontal split Tokens | Symbol — still complex.
-        # Simplest match Advanced: only Symbol Table bottom. Move tokens to View menu or keep under symbol.
-        # I'll put Tokens table below Symbol in same panel with a label "Lexical Tokens" — actually that duplicates.
-        # Keep structure: Output top half, bottom half = horizontal: Lexical (left) Symbol (right)
-        tokens_wrap = self._panel()
-        tok_lay = QVBoxLayout(tokens_wrap)
-        tok_lay.setContentsMargins(8, 8, 8, 8)
-        tok_title = QLabel("Lexical Tokens", self)
-        tok_title.setObjectName("panelTitle")
-        tok_lay.addWidget(tok_title)
-        tok_lay.addWidget(self._tokens, 1)
-
-        right_bottom = QSplitter(Qt.Horizontal, self)
-        right_bottom.addWidget(tokens_wrap)
-        right_bottom.addWidget(sym_wrap)
-        right_bottom.setStretchFactor(0, 1)
-        right_bottom.setStretchFactor(1, 1)
-
-        right_split = QSplitter(Qt.Vertical, self)
-        right_split.addWidget(out_wrap)
-        right_split.addWidget(right_bottom)
-        right_split.setStretchFactor(0, 2)
-        right_split.setStretchFactor(1, 2)
+        right_wrap = self._panel()
+        right_lay = QVBoxLayout(right_wrap)
+        right_lay.setContentsMargins(8, 8, 8, 8)
+        right_lay.addWidget(self._right_tabs)
 
         main_split = QSplitter(Qt.Horizontal, self)
         main_split.addWidget(left_wrap)
-        main_split.addWidget(right_split)
+        main_split.addWidget(right_wrap)
         main_split.setStretchFactor(0, 58)
         main_split.setStretchFactor(1, 42)
 
         container = QWidget(self)
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(0)
-        layout.addWidget(main_split)
+        layout.setContentsMargins(8, 0, 8, 8)
+        layout.setSpacing(8)
+        layout.addWidget(header)
+        layout.addWidget(main_split, 1)
         self.setCentralWidget(container)
 
     def _build_menu(self) -> None:
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
-        self._act_open = QAction("Open...", self)
+        self._act_open = QAction("Open…", self)
+        self._act_open.setShortcut(QKeySequence.Open)
         self._act_open.triggered.connect(self.open_file)
         file_menu.addAction(self._act_open)
         self._act_save = QAction("Save", self)
+        self._act_save.setShortcut(QKeySequence.Save)
         self._act_save.triggered.connect(self.save_file)
         file_menu.addAction(self._act_save)
-        self._act_save_as = QAction("Save As...", self)
+        self._act_save_as = QAction("Save As…", self)
+        self._act_save_as.setShortcut(QKeySequence.SaveAs)
         self._act_save_as.triggered.connect(self.save_file_as)
         file_menu.addAction(self._act_save_as)
         file_menu.addSeparator()
+        act_sample = QAction("Load Sample Program", self)
+        act_sample.triggered.connect(self._load_sample)
+        file_menu.addAction(act_sample)
+        file_menu.addSeparator()
         self._act_exit = QAction("Exit", self)
+        self._act_exit.setShortcut(QKeySequence.Quit)
         self._act_exit.triggered.connect(self.close)
         file_menu.addAction(self._act_exit)
 
         view_menu = menubar.addMenu("&View")
         self._act_dark = QAction("Dark Mode", self, checkable=True)
-        self._act_dark.setChecked(False)
         self._act_dark.triggered.connect(self._toggle_dark_from_menu)
         view_menu.addAction(self._act_dark)
 
-        run_menu = menubar.addMenu("&Run")
-        run_menu.addAction("Compile", self.compile_code)
-        run_menu.addAction("Run Program", self.run_program)
+        run_menu = menubar.addMenu("&Build")
+        act_compile = QAction("Compile", self)
+        act_compile.setShortcut("F7")
+        act_compile.triggered.connect(self.compile_code)
+        run_menu.addAction(act_compile)
+        act_opt = QAction("Optimize", self)
+        act_opt.setShortcut("Ctrl+Shift+O")
+        act_opt.triggered.connect(self.optimize_current_code)
+        run_menu.addAction(act_opt)
+        act_run = QAction("Run Program", self)
+        act_run.setShortcut("F5")
+        act_run.triggered.connect(self.run_program)
+        run_menu.addAction(act_run)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main", self)
         tb.setMovable(False)
-        tb.setIconSize(tb.iconSize())
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
         st = self.style()
 
         a_compile = QAction(st.standardIcon(QStyle.SP_DialogApplyButton), "Compile", self)
+        a_compile.setToolTip("Compile (F7)")
         a_compile.triggered.connect(self.compile_code)
         tb.addAction(a_compile)
 
         a_run = QAction(st.standardIcon(QStyle.SP_MediaPlay), "Run", self)
+        a_run.setToolTip("Run program (F5)")
         a_run.triggered.connect(self.run_program)
         tb.addAction(a_run)
 
-        a_clear = QAction(st.standardIcon(QStyle.SP_TrashIcon), "Clear Output", self)
+        a_opt = QAction(st.standardIcon(QStyle.SP_BrowserReload), "Optimize", self)
+        a_opt.setToolTip("Optimize code (Ctrl+Shift+O)")
+        a_opt.triggered.connect(self.optimize_current_code)
+        tb.addAction(a_opt)
+
+        tb.addSeparator()
+
+        a_clear = QAction(st.standardIcon(QStyle.SP_TrashIcon), "Clear Panels", self)
         a_clear.triggered.connect(self.clear_output)
         tb.addAction(a_clear)
 
         tb.addSeparator()
-        self._chk_dark = QCheckBox(" Dark", self)
-        self._chk_dark.setChecked(False)
+        self._chk_dark = QCheckBox(" Dark theme", self)
         self._chk_dark.stateChanged.connect(self._on_dark_checkbox)
         tb.addWidget(self._chk_dark)
 
     def _build_status_bar(self) -> None:
         sb = QStatusBar(self)
         self.setStatusBar(sb)
-        self._lbl_pos = QLabel("Ln 1, Col 1", self)
+        self._lbl_compile_status = QLabel("Ready")
+        self._lbl_gcc = QLabel(self._gcc_status_text())
+        self._lbl_pos = QLabel("Ln 1, Col 1")
+        sb.addWidget(self._lbl_compile_status, 1)
+        sb.addPermanentWidget(self._lbl_gcc)
         sb.addPermanentWidget(self._lbl_pos)
+
+    def _setup_shortcuts(self) -> None:
+        pass  # shortcuts attached to QAction in menu
+
+    def _gcc_status_text(self) -> str:
+        gcc = shutil.which("gcc")
+        return "GCC: available" if gcc else "GCC: not found"
 
     def _error_colors(self) -> dict:
         return ERROR_COLORS_DARK if self._dark_mode else ERROR_COLORS_LIGHT
 
     def _apply_theme(self) -> None:
         app = QApplication.instance()
-        if self._dark_mode:
-            app.setStyleSheet(_dark_stylesheet())
-        else:
-            app.setStyleSheet(_light_stylesheet())
+        app.setStyleSheet(load_stylesheet(self._dark_mode))
+        self._editor.set_theme(self._dark_mode)
+        if self._compile_messages:
+            self._problems.set_messages(self._compile_messages, self._error_colors(), self._dark_mode)
         self._populate_symbol_table(self._editor.toPlainText())
 
     def _toggle_dark_from_menu(self) -> None:
@@ -384,6 +383,22 @@ class MainWindow(QMainWindow):
         finally:
             self._block_dark_sync = False
 
+    def _set_compile_status(self, text: str) -> None:
+        self._lbl_compile_status.setText(text)
+
+    def _update_window_title(self) -> None:
+        name = os.path.basename(self._current_path) if self._current_path else "Untitled"
+        dirty = " ●" if self._dirty else ""
+        self._lbl_file.setText(name + dirty)
+        self._lbl_dirty.setText("modified" if self._dirty else "")
+        self.setWindowTitle(f"{name}{dirty} — Advanced Compiler IDE")
+
+    def _mark_dirty(self, dirty: bool = True) -> None:
+        if self._block_dirty:
+            return
+        self._dirty = dirty
+        self._update_window_title()
+
     def _update_status_cursor(self) -> None:
         c = self._editor.textCursor()
         ln = c.blockNumber() + 1
@@ -392,9 +407,23 @@ class MainWindow(QMainWindow):
 
     def _on_text_changed(self) -> None:
         code = self._editor.toPlainText()
+        has_code = bool(code.strip())
+        self._editor_stack.setCurrentIndex(1 if has_code else 0)
+        self._mark_dirty(True)
         _, tokens = lexical_analysis(code)
         self._populate_tokens(tokens_as_rows(tokens))
         self._populate_symbol_table(code)
+
+    def _load_sample(self) -> None:
+        self._editor_stack.setCurrentIndex(1)
+        self._block_dirty = True
+        try:
+            self._editor.setPlainText(SAMPLE_CODE)
+            self._current_path = None
+        finally:
+            self._block_dirty = False
+        self._mark_dirty(True)
+        self.statusBar().showMessage("Sample program loaded", 2500)
 
     def _populate_tokens(self, rows: List[Tuple[str, str, int, int]]) -> None:
         self._tokens.setRowCount(len(rows))
@@ -424,15 +453,17 @@ class MainWindow(QMainWindow):
         if not item:
             return
         try:
-            ln = int(item.text())
+            self._editor.scroll_to_line(int(item.text()))
         except ValueError:
-            return
-        self._editor.scroll_to_line(ln)
+            pass
 
     def clear_output(self) -> None:
         self._output.clear()
+        self._opt_log.clear()
+        self._problems.clear_all()
         self._compile_messages = []
         self._editor.clear_error_lines()
+        self._set_compile_status("Ready")
 
     def _append_output(self, text: str) -> None:
         if not text.endswith("\n"):
@@ -441,12 +472,39 @@ class MainWindow(QMainWindow):
         self._output.insertPlainText(text)
         self._output.moveCursor(QTextCursor.End)
 
+    def _append_opt_log(self, text: str) -> None:
+        if not text.endswith("\n"):
+            text += "\n"
+        self._opt_log.moveCursor(QTextCursor.End)
+        self._opt_log.insertPlainText(text)
+        self._opt_log.moveCursor(QTextCursor.End)
+
+    def _show_problems(self, messages: List[CompileMessage]) -> None:
+        self._compile_messages = messages
+        self._problems.set_messages(messages, self._error_colors(), self._dark_mode)
+        self._right_tabs.setCurrentWidget(self._problems)
+        self._output.clear()
+        if not messages:
+            self._append_output("Build finished: no issues found.")
+            self._right_tabs.setCurrentWidget(self._output)
+            return
+        self._append_output(f"Build finished: {len(messages)} issue(s). See Problems tab (double-click a row to jump).")
+        for m in messages:
+            line_part = f"Line {m.line}: " if m.line > 0 else ""
+            self._append_output(f"{line_part}[{m.kind}] {m.message}")
+
     def open_file(self) -> None:
         res = open_c_file(self)
         if not res.path:
             return
+        self._editor_stack.setCurrentIndex(1)
         self._current_path = res.path
-        self._editor.setPlainText(res.content or "")
+        self._block_dirty = True
+        try:
+            self._editor.setPlainText(res.content or "")
+        finally:
+            self._block_dirty = False
+        self._mark_dirty(False)
         self.statusBar().showMessage(f"Opened {os.path.basename(res.path)}", 3000)
 
     def save_file(self) -> None:
@@ -457,8 +515,8 @@ class MainWindow(QMainWindow):
         if not self._current_path:
             self.save_file_as()
             return
-        ok = save_file(self, self._current_path, code)
-        if ok:
+        if save_file(self, self._current_path, code):
+            self._mark_dirty(False)
             self.statusBar().showMessage("Saved", 2000)
         else:
             QMessageBox.warning(self, "Save failed", "Could not save file.")
@@ -473,6 +531,7 @@ class MainWindow(QMainWindow):
             return
         if ok:
             self._current_path = path
+            self._mark_dirty(False)
             self.statusBar().showMessage("Saved As", 2000)
         else:
             QMessageBox.warning(self, "Save failed", "Could not save file.")
@@ -482,17 +541,11 @@ class MainWindow(QMainWindow):
         self.clear_output()
 
         if not code.strip():
-            self._append_output("Info: No input provided.")
             QMessageBox.information(self, "Empty input", "Please type or open a C program first.")
             return
 
-        dlg = QProgressDialog("Compiling...", None, 0, 0, self)
-        dlg.setWindowTitle("Advanced Compiler GUI")
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setCancelButton(None)
-        dlg.show()
-        QApplication.processEvents()
-
+        self._set_compile_status("Compiling…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             self._last_build_dir = tempfile.mkdtemp(prefix="ccompiler_gui_")
             src_path = os.path.join(self._last_build_dir, "temp.c")
@@ -504,81 +557,97 @@ class MainWindow(QMainWindow):
             sem_errs = semantic_check(code)
             syn_errs = compile_with_gcc(src_path, exe_path)
 
-            messages: List[CompileMessage] = []
-            for ln, msg in lex_errs:
-                messages.append(CompileMessage(ln, "Lexical", msg))
-            for ln, msg in sem_errs:
-                messages.append(CompileMessage(ln, "Semantic", msg))
-            for ln, msg in syn_errs:
-                messages.append(CompileMessage(ln, "Syntax", msg))
+            root_lines = find_root_error_lines(lex_errs, syn_errs)
+            syn_errs, cascade_note = filter_cascade_syntax_errors(syn_errs, root_lines)
 
-            messages.sort(key=lambda m: (m.line, m.kind))
-            self._compile_messages = messages
+            messages: List[CompileMessage] = []
+            if cascade_note:
+                messages.append(CompileMessage(0, "Info", cascade_note, ""))
+            for ln, msg, sug in lex_errs:
+                messages.append(CompileMessage(ln, "Lexical", msg, sug))
+            for ln, msg, sug in syn_errs:
+                messages.append(CompileMessage(ln, "Syntax", msg, sug))
+            for ln, msg, sug in sem_errs:
+                messages.append(CompileMessage(ln, "Semantic", msg, sug))
+
+            _kind_order = {"Info": 0, "Lexical": 1, "Syntax": 2, "Semantic": 3}
+            messages.sort(key=lambda m: (m.line if m.line > 0 else -1, _kind_order.get(m.kind, 9)))
 
             self._populate_tokens(tokens_as_rows(tokens))
             self._populate_symbol_table(code)
 
             if not messages:
-                self._append_output("Output:\n")
-                self._append_output("Success: No errors found. Compilation succeeded.")
-                self.statusBar().showMessage("Compile succeeded", 3000)
+                self._show_problems([])
                 self._last_exe_path = exe_path
                 self._editor.clear_error_lines()
+                self._set_compile_status("Build succeeded")
+                self.statusBar().showMessage("Compile succeeded", 3000)
                 return
 
-            self._render_messages(messages)
+            self._show_problems(messages)
             self._highlight_error_lines(messages)
-
-            first = messages[0]
-            self._editor.scroll_to_line(first.line)
+            first = next((m for m in messages if m.line > 0), messages[0])
+            if first.line > 0:
+                self._editor.scroll_to_line(first.line)
+            self._set_compile_status(f"{len(messages)} issue(s)")
             self.statusBar().showMessage(f"Compile found {len(messages)} issue(s)", 4000)
         finally:
-            dlg.close()
+            QApplication.restoreOverrideCursor()
 
-    def _render_messages(self, messages: List[CompileMessage]) -> None:
+    def optimize_current_code(self) -> None:
+        code = self._editor.toPlainText()
         self._output.clear()
-        for m in messages:
-            self._append_output(f"Line {m.line} → {m.message}")
+        self._opt_log.clear()
+        self._problems.clear_all()
 
-        self._apply_output_coloring(messages)
+        if not code.strip():
+            QMessageBox.information(self, "Empty input", "Please type or open a C program first.")
+            return
 
-    def _apply_output_coloring(self, messages: List[CompileMessage]) -> None:
-        doc = self._output.document()
-        cursor = self._output.textCursor()
-        colors = self._error_colors()
-        cursor.beginEditBlock()
+        self._set_compile_status("Optimizing…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            block = doc.firstBlock()
-            i = 0
-            while block.isValid() and i < len(messages):
-                m = messages[i]
-                fmt = QTextCharFormat()
-                fmt.setForeground(colors.get(m.kind, QColor("#111" if not self._dark_mode else "#d4d4d4")))
+            lex_errs, tokens = lexical_analysis(code)
+            if lex_errs:
+                self._append_output("Warning: lexical issue(s) — best-effort optimization.\n")
+                for ln, msg, sug in lex_errs:
+                    self._append_output(f"Line {ln} → {msg}")
+                    if sug:
+                        self._append_opt_log(f"Line {ln}: {sug}")
 
-                c = QTextCursor(block)
-                c.select(QTextCursor.LineUnderCursor)
-                c.mergeCharFormat(fmt)
+            optimized, notes = optimize_code(code)
+            if optimized.strip() == code.strip():
+                self._append_output("Code is already optimized (no safe changes found).")
+                self._right_tabs.setCurrentWidget(self._output)
+                self._set_compile_status("No changes")
+                return
 
-                block.setUserData(_TooltipData(m.message))
+            cur = self._editor.textCursor()
+            cur.beginEditBlock()
+            try:
+                self._editor.selectAll()
+                self._editor.insertPlainText(optimized)
+            finally:
+                cur.endEditBlock()
 
-                block = block.next()
-                i += 1
+            _, opt_tokens = lexical_analysis(optimized)
+            self._populate_tokens(tokens_as_rows(opt_tokens))
+            self._populate_symbol_table(optimized)
+
+            self._append_output("Optimization applied successfully.")
+            self._opt_log.clear()
+            for n in notes:
+                if n.line > 0:
+                    self._append_opt_log(f"Line {n.line}: {n.message}")
+                else:
+                    self._append_opt_log(n.message)
+
+            self._right_tabs.setCurrentWidget(self._opt_log)
+            self._mark_dirty(True)
+            self._set_compile_status("Optimized")
+            self.statusBar().showMessage("Code optimized", 2500)
         finally:
-            cursor.endEditBlock()
-
-        self._output.viewport().setMouseTracking(True)
-        self._output.mouseMoveEvent = self._output_mouse_move_event  # type: ignore[method-assign]
-
-    def _output_mouse_move_event(self, event):
-        pos = event.pos()
-        c = self._output.cursorForPosition(pos)
-        block = c.block()
-        data = block.userData()
-        if isinstance(data, _TooltipData):
-            self._output.setToolTip(data.text)
-        else:
-            self._output.setToolTip("")
-        QPlainTextEdit.mouseMoveEvent(self._output, event)
+            QApplication.restoreOverrideCursor()
 
     def _highlight_error_lines(self, messages: List[CompileMessage]) -> None:
         lines = sorted({m.line for m in messages if m.line > 0})
@@ -595,7 +664,7 @@ class MainWindow(QMainWindow):
             text, ok = QInputDialog.getMultiLineText(
                 self,
                 "Program Input",
-                "Enter input for scanf (each value separated by space/newline):",
+                "Enter input for scanf (values separated by space or newline):",
                 "",
             )
             if not ok:
@@ -604,31 +673,30 @@ class MainWindow(QMainWindow):
             if stdin_text and not stdin_text.endswith("\n"):
                 stdin_text += "\n"
 
+        self._set_compile_status("Running…")
+        self._right_tabs.setCurrentWidget(self._output)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             proc = run_executable(self._last_exe_path, stdin_text=stdin_text, timeout_s=10.0)
         except TimeoutError:
-            self._append_output("\n--- Program Error ---\n")
-            self._append_output("Program timed out (it may still be waiting for more input).")
+            self._append_output("\n--- Runtime ---\nProgram timed out.\n")
+            self._set_compile_status("Timed out")
             return
         except Exception as e:
-            self._append_output("\n--- Program Error ---\n")
-            self._append_output(str(e))
+            self._append_output(f"\n--- Runtime ---\n{e}\n")
+            self._set_compile_status("Run failed")
             return
+        finally:
+            QApplication.restoreOverrideCursor()
 
-        self._append_output("\nOutput:\n")
-        out = proc.stdout.rstrip("\n") if proc.stdout else ""
-        if out:
-            # Highlight main numeric output in green (simple)
-            self._append_output(out)
+        self._append_output("\n--- Program output ---\n")
+        if proc.stdout:
+            self._append_output(proc.stdout.rstrip("\n"))
         if proc.stderr:
-            self._append_output("\n--- Program Errors ---\n")
+            self._append_output("\n--- stderr ---\n")
             self._append_output(proc.stderr.rstrip("\n"))
-
         if not proc.stdout and not proc.stderr:
-            self._append_output("(No output)")
+            self._append_output("(no output)")
 
-
-class _TooltipData(QTextBlockUserData):
-    def __init__(self, text: str):
-        super().__init__()
-        self.text = text
+        self._set_compile_status("Run finished")
+        self.statusBar().showMessage("Program finished", 3000)
